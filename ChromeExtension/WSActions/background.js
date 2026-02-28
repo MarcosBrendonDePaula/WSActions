@@ -14,38 +14,216 @@ chrome.runtime.onStartup.addListener(() => {
     });
 });
 
-// Gerenciamento do Debugger
-let attachedTabs = new Set();
+// ============================================
+// CDP (Chrome DevTools Protocol) Engine
+// Two modes:
+//   transient (default): attach → execute → detach (bar flashes ~200ms)
+//   persistent: stays attached (use --silent-debugger-extension-api)
+// ============================================
 
-// Função para anexar o debugger a uma aba
+const CDP_VERSION = '1.3';
+let attachedTabs = new Set();
+let cdpMode = 'transient'; // 'transient' or 'persistent'
+const tabMousePos = {};
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function gaussianRandom(mean, stdDev) {
+    let u1; do { u1 = Math.random(); } while (u1 === 0);
+    const u2 = Math.random();
+    return Math.max(0, mean + Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2) * stdDev);
+}
+
+function humanDelay(min, max) {
+    return Math.floor(gaussianRandom((min + max) / 2, (max - min) / 4));
+}
+
+function bezierPoints(sx, sy, ex, ey, steps) {
+    const pts = [];
+    const c1x = sx + (ex - sx) * (0.2 + Math.random() * 0.3);
+    const c1y = sy + (Math.random() - 0.5) * Math.abs(ey - sy) * 0.8;
+    const c2x = sx + (ex - sx) * (0.5 + Math.random() * 0.3);
+    const c2y = ey + (Math.random() - 0.5) * Math.abs(ey - sy) * 0.4;
+    for (let i = 0; i <= steps; i++) {
+        const t = i / steps, mt = 1 - t;
+        pts.push({
+            x: mt*mt*mt*sx + 3*mt*mt*t*c1x + 3*mt*t*t*c2x + t*t*t*ex,
+            y: mt*mt*mt*sy + 3*mt*mt*t*c1y + 3*mt*t*t*c2y + t*t*t*ey
+        });
+    }
+    return pts;
+}
+
 async function attachDebugger(tabId) {
     if (attachedTabs.has(tabId)) return;
-    
     try {
-        await chrome.debugger.attach({ tabId }, '1.3');
+        await chrome.debugger.attach({ tabId }, CDP_VERSION);
         attachedTabs.add(tabId);
-        console.log(`Debugger attached to tab ${tabId}`);
     } catch (error) {
         console.error('Error attaching debugger:', error);
+        throw error;
     }
 }
 
-// Função para desanexar o debugger de uma aba
 async function detachDebugger(tabId) {
     if (!attachedTabs.has(tabId)) return;
-    
     try {
         await chrome.debugger.detach({ tabId });
         attachedTabs.delete(tabId);
-        console.log(`Debugger detached from tab ${tabId}`);
     } catch (error) {
         console.error('Error detaching debugger:', error);
     }
 }
 
-// Listener para comandos do debugger
+function cdpSend(tabId, method, params) {
+    return new Promise((resolve, reject) => {
+        chrome.debugger.sendCommand({ tabId }, method, params || {}, (result) => {
+            if (chrome.runtime.lastError) {
+                reject(new Error(chrome.runtime.lastError.message));
+            } else {
+                resolve(result);
+            }
+        });
+    });
+}
+
+/**
+ * Execute fn with debugger attached.
+ * Transient mode: attach → fn() → detach (bar flashes briefly)
+ * Persistent mode: attach once, stay attached
+ */
+async function withCDP(tabId, fn) {
+    await attachDebugger(tabId);
+    try {
+        return await fn(tabId);
+    } finally {
+        if (cdpMode === 'transient') {
+            await sleep(50);
+            await detachDebugger(tabId);
+        }
+    }
+}
+
+// --- CDP Actions (humanized) ---
+
+async function cdpClick(tabId, x, y) {
+    const ox = (Math.random() - 0.5) * 6;
+    const oy = (Math.random() - 0.5) * 6;
+    const tx = x + ox, ty = y + oy;
+    const last = tabMousePos[tabId] || { x: Math.random() * 500, y: Math.random() * 400 };
+
+    const steps = 8 + Math.floor(Math.random() * 12);
+    const pts = bezierPoints(last.x, last.y, tx, ty, steps);
+    for (const p of pts) {
+        await cdpSend(tabId, 'Input.dispatchMouseEvent', {
+            type: 'mouseMoved', x: Math.round(p.x), y: Math.round(p.y),
+            button: 'none', pointerType: 'mouse'
+        });
+        await sleep(humanDelay(4, 18));
+    }
+    await sleep(humanDelay(20, 60));
+    await cdpSend(tabId, 'Input.dispatchMouseEvent', {
+        type: 'mousePressed', x: Math.round(tx), y: Math.round(ty),
+        button: 'left', clickCount: 1, pointerType: 'mouse'
+    });
+    await sleep(humanDelay(40, 120));
+    await cdpSend(tabId, 'Input.dispatchMouseEvent', {
+        type: 'mouseReleased', x: Math.round(tx), y: Math.round(ty),
+        button: 'left', clickCount: 1, pointerType: 'mouse'
+    });
+    tabMousePos[tabId] = { x: tx, y: ty };
+    return { success: true };
+}
+
+async function cdpType(tabId, text) {
+    for (let i = 0; i < text.length; i++) {
+        const ch = text[i], code = ch.charCodeAt(0);
+        await cdpSend(tabId, 'Input.dispatchKeyEvent', {
+            type: 'keyDown', key: ch, code: `Key${ch.toUpperCase()}`,
+            text: ch, windowsVirtualKeyCode: code, nativeVirtualKeyCode: code
+        });
+        await sleep(humanDelay(2, 6));
+        await cdpSend(tabId, 'Input.dispatchKeyEvent', {
+            type: 'char', key: ch, code: `Key${ch.toUpperCase()}`,
+            text: ch, windowsVirtualKeyCode: code, nativeVirtualKeyCode: code
+        });
+        await sleep(humanDelay(2, 6));
+        await cdpSend(tabId, 'Input.dispatchKeyEvent', {
+            type: 'keyUp', key: ch, code: `Key${ch.toUpperCase()}`,
+            windowsVirtualKeyCode: code, nativeVirtualKeyCode: code
+        });
+        if (ch === ' ' || ch === '.' || ch === ',') await sleep(humanDelay(70, 220));
+        else await sleep(humanDelay(20, 90));
+        if (Math.random() < 0.05) await sleep(humanDelay(120, 450));
+    }
+    return { success: true };
+}
+
+async function cdpKeyPress(tabId, key, modifiers) {
+    const map = {
+        'Enter':13,'Tab':9,'Escape':27,'Backspace':8,'Delete':46,
+        'ArrowUp':38,'ArrowDown':40,'ArrowLeft':37,'ArrowRight':39,'Space':32
+    };
+    const kc = map[key] || 0;
+    await cdpSend(tabId, 'Input.dispatchKeyEvent', {
+        type: 'keyDown', key, code: key, modifiers: modifiers || 0,
+        windowsVirtualKeyCode: kc, nativeVirtualKeyCode: kc
+    });
+    await sleep(humanDelay(25, 70));
+    await cdpSend(tabId, 'Input.dispatchKeyEvent', {
+        type: 'keyUp', key, code: key, modifiers: modifiers || 0,
+        windowsVirtualKeyCode: kc, nativeVirtualKeyCode: kc
+    });
+    return { success: true };
+}
+
+async function cdpScroll(tabId, x, y, deltaX, deltaY) {
+    await cdpSend(tabId, 'Input.dispatchMouseEvent', {
+        type: 'mouseWheel', x: Math.round(x), y: Math.round(y),
+        deltaX, deltaY, pointerType: 'mouse'
+    });
+    return { success: true };
+}
+
+async function cdpNavigate(tabId, url) {
+    await cdpSend(tabId, 'Page.navigate', { url });
+    return { success: true };
+}
+
+async function cdpBatch(tabId, actions) {
+    const results = [];
+    for (const a of actions) {
+        try {
+            let r;
+            switch (a.action) {
+                case 'click': r = await cdpClick(tabId, a.x, a.y); break;
+                case 'type': r = await cdpType(tabId, a.text); break;
+                case 'keypress': r = await cdpKeyPress(tabId, a.key, a.modifiers || 0); break;
+                case 'scroll': r = await cdpScroll(tabId, a.x||0, a.y||0, a.deltaX||0, a.deltaY||0); break;
+                case 'navigate': r = await cdpNavigate(tabId, a.url); break;
+                default: r = { success: false, error: `Unknown: ${a.action}` };
+            }
+            results.push(r);
+        } catch (err) {
+            results.push({ success: false, error: err.message });
+        }
+    }
+    return { success: true, results };
+}
+
+// Cleanup on tab close
+chrome.tabs.onRemoved.addListener((tabId) => {
+    attachedTabs.delete(tabId);
+    delete tabMousePos[tabId];
+});
+
+// Cleanup on debugger detach (user clicked infobar X)
+chrome.debugger.onDetach.addListener((source) => {
+    if (source.tabId) attachedTabs.delete(source.tabId);
+});
+
+// Forward debugger events to content script
 chrome.debugger.onEvent.addListener((source, method, params) => {
-    // Encaminha eventos do debugger para o content script
     if (source.tabId) {
         chrome.tabs.sendMessage(source.tabId, {
             type: 'debugger_event',
@@ -67,24 +245,80 @@ chrome.webNavigation.onCommitted.addListener((details) => {
 
 // Listener para mensagens internas (do content script)
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-    // Tratamento específico para comandos do debugger
+    // --- WSActions CDP humanized actions (from CDP bridge) ---
+    if (request && request.source === 'wsactions-cdp') {
+        const tabId = sender.tab?.id;
+        if (!tabId) {
+            sendResponse({ success: false, error: 'No tab ID' });
+            return false;
+        }
+        (async () => {
+            try {
+                let result;
+                switch (request.action) {
+                    case 'click':
+                        result = await withCDP(tabId, (id) => cdpClick(id, request.x, request.y));
+                        break;
+                    case 'type':
+                        result = await withCDP(tabId, (id) => cdpType(id, request.text));
+                        break;
+                    case 'keypress':
+                        result = await withCDP(tabId, (id) => cdpKeyPress(id, request.key, request.modifiers || 0));
+                        break;
+                    case 'scroll':
+                        result = await withCDP(tabId, (id) => cdpScroll(id, request.x||0, request.y||0, request.deltaX||0, request.deltaY||0));
+                        break;
+                    case 'navigate':
+                        result = await withCDP(tabId, (id) => cdpNavigate(id, request.url));
+                        break;
+                    case 'batch':
+                        result = await withCDP(tabId, (id) => cdpBatch(id, request.actions));
+                        break;
+                    case 'attach':
+                        result = await withCDP(tabId, async () => ({ success: true }));
+                        break;
+                    case 'detach':
+                        await detachDebugger(tabId);
+                        result = { success: true };
+                        break;
+                    case 'setMode':
+                        cdpMode = request.mode === 'persistent' ? 'persistent' : 'transient';
+                        result = { success: true, mode: cdpMode };
+                        break;
+                    case 'sendCommand':
+                        // Raw CDP command passthrough
+                        result = await withCDP(tabId, (id) => cdpSend(id, request.command, request.params));
+                        result = { success: true, result };
+                        break;
+                    default:
+                        result = { success: false, error: `Unknown CDP action: ${request.action}` };
+                }
+                sendResponse(result);
+            } catch (err) {
+                sendResponse({ success: false, error: err.message });
+            }
+        })();
+        return true;
+    }
+
+    // --- Legacy debugger_command protocol (from content script permission system) ---
     if (request.type === 'debugger_command') {
         const tabId = sender.tab.id;
-        
+
         if (request.action === 'attach') {
             attachDebugger(tabId)
                 .then(() => sendResponse({ success: true }))
                 .catch(error => sendResponse({ success: false, error: error.message }));
             return true;
         }
-        
+
         if (request.action === 'detach') {
             detachDebugger(tabId)
                 .then(() => sendResponse({ success: true }))
                 .catch(error => sendResponse({ success: false, error: error.message }));
             return true;
         }
-        
+
         if (request.action === 'sendCommand') {
             chrome.debugger.sendCommand(
                 { tabId },

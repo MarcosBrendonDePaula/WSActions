@@ -203,4 +203,6 @@ WSAction_build_*-ALPHA.zip
 WSAction_build_*
 TEMP
 
-extensions
+extensions/*
+# But include built-in extensions
+!extensions/TOOLS

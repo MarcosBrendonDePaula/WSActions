@@ -1,0 +1,8 @@
+{
+    "name": "TOOLS",
+    "version": "1.0.0",
+    "description": "Browser automation tools with stealth capabilities, profile launcher, and CDP controls",
+    "id": "TOOLS",
+    "WEB_SCRIPTS": ["client.js"],
+    "GLOBAL_SCRIPTS": ["stealth.js"]
+}

@@ -113,7 +113,7 @@ function injectClientScript({ ip, port, delay }) {
 }
 
 // =======================
-// Debugger Bridge
+// Debugger Bridge (legacy)
 // =======================
 
 /**
@@ -134,6 +134,85 @@ function sendDebuggerCommand(action, params = {}) {
             } else {
                 resolve(response);
             }
+        });
+    });
+}
+
+// =======================
+// CDP Bridge (humanized)
+// Injects window.__wsactions_cdp into page context
+// Page → postMessage → content script → chrome.runtime.sendMessage → background
+// =======================
+
+/**
+ * Inject the CDP bridge object into the page context.
+ * This gives page-level scripts (client.js, extensions) access to:
+ *   window.__wsactions_cdp.click(x, y)
+ *   window.__wsactions_cdp.type(text)
+ *   window.__wsactions_cdp.keypress(key, modifiers)
+ *   window.__wsactions_cdp.scroll(x, y, deltaX, deltaY)
+ *   window.__wsactions_cdp.navigate(url)
+ *   window.__wsactions_cdp.batch(actions)
+ *   window.__wsactions_cdp.setMode('transient'|'persistent')
+ *   window.__wsactions_cdp.sendCommand(method, params) // raw CDP
+ */
+function injectCDPBridge() {
+    const script = document.createElement('script');
+    script.textContent = `
+    (function() {
+        function cdpRequest(data) {
+            return new Promise(function(resolve) {
+                var id = 'cdp_' + Math.random().toString(36).substr(2, 9);
+                window.addEventListener('message', function handler(event) {
+                    if (event.data && event.data.source === 'wsactions-cdp-response' && event.data.id === id) {
+                        window.removeEventListener('message', handler);
+                        resolve(event.data.result);
+                    }
+                });
+                data.source = 'wsactions-cdp-request';
+                data.id = id;
+                window.postMessage(data, '*');
+            });
+        }
+
+        window.__wsactions_cdp = {
+            click: function(x, y) { return cdpRequest({ action: 'click', x: x, y: y }); },
+            type: function(text) { return cdpRequest({ action: 'type', text: text }); },
+            keypress: function(key, mod) { return cdpRequest({ action: 'keypress', key: key, modifiers: mod || 0 }); },
+            scroll: function(x, y, dx, dy) { return cdpRequest({ action: 'scroll', x: x, y: y, deltaX: dx, deltaY: dy }); },
+            navigate: function(url) { return cdpRequest({ action: 'navigate', url: url }); },
+            attach: function() { return cdpRequest({ action: 'attach' }); },
+            detach: function() { return cdpRequest({ action: 'detach' }); },
+            setMode: function(mode) { return cdpRequest({ action: 'setMode', mode: mode }); },
+            batch: function(actions) { return cdpRequest({ action: 'batch', actions: actions }); },
+            sendCommand: function(method, params) { return cdpRequest({ action: 'sendCommand', command: method, params: params || {} }); }
+        };
+
+        window.dispatchEvent(new CustomEvent('wsactions-cdp-ready'));
+    })();
+    `;
+    (document.head || document.documentElement).appendChild(script);
+    script.remove();
+}
+
+/**
+ * Relay CDP bridge messages from page context to background script.
+ */
+function setupCDPRelay() {
+    window.addEventListener('message', function(event) {
+        if (event.source !== window) return;
+        if (!event.data || event.data.source !== 'wsactions-cdp-request') return;
+
+        const { id, ...rest } = event.data;
+        // Rewrite source for background to identify
+        rest.source = 'wsactions-cdp';
+
+        chrome.runtime.sendMessage(rest, function(result) {
+            window.postMessage({
+                source: 'wsactions-cdp-response',
+                id: id,
+                result: result || { success: false, error: 'No response' }
+            }, '*');
         });
     });
 }
@@ -379,6 +458,10 @@ async function initialize() {
             getValue('allowedExtensionNames'),
         ]);
 
+        // Injeta o CDP bridge (antes dos outros scripts para estar disponível)
+        injectCDPBridge();
+        setupCDPRelay();
+
         // Injeta o script de identificador
         injectIdentifierScript({ ip, port, identifier, delay, allowedExtensionNames });
 
@@ -388,7 +471,7 @@ async function initialize() {
         // Adiciona o listener para mensagens
         window.addEventListener("message", messageListener, false);
 
-        console.log('WSActions Bridge initialized');
+        console.log('WSActions Bridge initialized (CDP bridge active)');
     } catch (error) {
         console.error('Erro durante a inicialização:', error);
     }
