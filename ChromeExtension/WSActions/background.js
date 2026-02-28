@@ -14,33 +14,335 @@ chrome.runtime.onStartup.addListener(() => {
     });
 });
 
-// Gerenciamento do Debugger
-let attachedTabs = new Set();
+// =======================
+// Utilitários de Humanização
+// =======================
 
-// Função para anexar o debugger a uma aba
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function gaussianRandom(mean, stddev) {
+    let u = 0, v = 0;
+    while (u === 0) u = Math.random();
+    while (v === 0) v = Math.random();
+    const z = Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+    return z * stddev + mean;
+}
+
+function humanDelay(minMs = 30, maxMs = 120) {
+    const delay = gaussianRandom((minMs + maxMs) / 2, (maxMs - minMs) / 4);
+    return Math.max(minMs, Math.min(maxMs, delay));
+}
+
+function bezierPoints(x0, y0, x1, y1, steps = 10) {
+    const points = [];
+    // Control points com variação aleatória para parecer humano
+    const cx1 = x0 + (x1 - x0) * 0.25 + (Math.random() - 0.5) * 50;
+    const cy1 = y0 + (y1 - y0) * 0.1 + (Math.random() - 0.5) * 50;
+    const cx2 = x0 + (x1 - x0) * 0.75 + (Math.random() - 0.5) * 50;
+    const cy2 = y0 + (y1 - y0) * 0.9 + (Math.random() - 0.5) * 50;
+
+    for (let i = 0; i <= steps; i++) {
+        const t = i / steps;
+        const invT = 1 - t;
+        const px = invT ** 3 * x0 + 3 * invT ** 2 * t * cx1 + 3 * invT * t ** 2 * cx2 + t ** 3 * x1;
+        const py = invT ** 3 * y0 + 3 * invT ** 2 * t * cy1 + 3 * invT * t ** 2 * cy2 + t ** 3 * y1;
+        points.push({ x: Math.round(px), y: Math.round(py) });
+    }
+    return points;
+}
+
+// =======================
+// Gerenciamento do Debugger (CDP)
+// =======================
+
+let attachedTabs = new Set();
+let cdpMode = 'transient'; // 'transient' ou 'persistent'
+
 async function attachDebugger(tabId) {
     if (attachedTabs.has(tabId)) return;
-    
+
     try {
         await chrome.debugger.attach({ tabId }, '1.3');
         attachedTabs.add(tabId);
         console.log(`Debugger attached to tab ${tabId}`);
     } catch (error) {
         console.error('Error attaching debugger:', error);
+        throw error;
     }
 }
 
-// Função para desanexar o debugger de uma aba
 async function detachDebugger(tabId) {
     if (!attachedTabs.has(tabId)) return;
-    
+
     try {
         await chrome.debugger.detach({ tabId });
         attachedTabs.delete(tabId);
         console.log(`Debugger detached from tab ${tabId}`);
     } catch (error) {
         console.error('Error detaching debugger:', error);
+        throw error;
     }
+}
+
+function sendCDPCommand(tabId, method, params = {}) {
+    return new Promise((resolve, reject) => {
+        chrome.debugger.sendCommand({ tabId }, method, params, (result) => {
+            if (chrome.runtime.lastError) {
+                reject(new Error(chrome.runtime.lastError.message));
+            } else {
+                resolve(result);
+            }
+        });
+    });
+}
+
+/**
+ * Wrapper transient: attach → execute fn → sleep(50) → detach
+ * No modo persistent, não faz detach.
+ */
+async function withCDP(tabId, fn) {
+    const wasAttached = attachedTabs.has(tabId);
+    if (!wasAttached) {
+        await attachDebugger(tabId);
+    }
+    try {
+        const result = await fn(tabId);
+        return result;
+    } finally {
+        if (!wasAttached && cdpMode === 'transient') {
+            await sleep(50);
+            await detachDebugger(tabId);
+        }
+    }
+}
+
+// =======================
+// Ações Humanizadas via CDP
+// =======================
+
+async function doClick(tabId, x, y) {
+    return withCDP(tabId, async () => {
+        // Movimento via curva Bezier a partir de posição aleatória
+        const startX = Math.random() * 200;
+        const startY = Math.random() * 200;
+        const offsetX = (Math.random() - 0.5) * 4;
+        const offsetY = (Math.random() - 0.5) * 4;
+        const targetX = x + offsetX;
+        const targetY = y + offsetY;
+
+        const points = bezierPoints(startX, startY, targetX, targetY, 8);
+        for (const pt of points) {
+            await sendCDPCommand(tabId, 'Input.dispatchMouseEvent', {
+                type: 'mouseMoved',
+                x: pt.x,
+                y: pt.y
+            });
+            await sleep(humanDelay(5, 20));
+        }
+
+        // Click com delays humanizados
+        await sendCDPCommand(tabId, 'Input.dispatchMouseEvent', {
+            type: 'mousePressed',
+            x: targetX,
+            y: targetY,
+            button: 'left',
+            clickCount: 1
+        });
+        await sleep(humanDelay(30, 80));
+        await sendCDPCommand(tabId, 'Input.dispatchMouseEvent', {
+            type: 'mouseReleased',
+            x: targetX,
+            y: targetY,
+            button: 'left',
+            clickCount: 1
+        });
+    });
+}
+
+async function doType(tabId, text) {
+    return withCDP(tabId, async () => {
+        for (const char of text) {
+            await sendCDPCommand(tabId, 'Input.dispatchKeyEvent', {
+                type: 'keyDown',
+                text: char,
+                key: char,
+                code: `Key${char.toUpperCase()}`,
+                unmodifiedText: char
+            });
+            await sleep(humanDelay(20, 50));
+            await sendCDPCommand(tabId, 'Input.dispatchKeyEvent', {
+                type: 'keyUp',
+                key: char,
+                code: `Key${char.toUpperCase()}`
+            });
+            await sleep(humanDelay(40, 150));
+        }
+    });
+}
+
+async function doKeyPress(tabId, key, modifiers = 0) {
+    return withCDP(tabId, async () => {
+        const keyMap = {
+            'Enter': { code: 'Enter', keyCode: 13, text: '\r' },
+            'Tab': { code: 'Tab', keyCode: 9, text: '' },
+            'Escape': { code: 'Escape', keyCode: 27, text: '' },
+            'Backspace': { code: 'Backspace', keyCode: 8, text: '' },
+            'ArrowUp': { code: 'ArrowUp', keyCode: 38, text: '' },
+            'ArrowDown': { code: 'ArrowDown', keyCode: 40, text: '' },
+            'ArrowLeft': { code: 'ArrowLeft', keyCode: 37, text: '' },
+            'ArrowRight': { code: 'ArrowRight', keyCode: 39, text: '' },
+            'Delete': { code: 'Delete', keyCode: 46, text: '' },
+            'Home': { code: 'Home', keyCode: 36, text: '' },
+            'End': { code: 'End', keyCode: 35, text: '' },
+            'PageUp': { code: 'PageUp', keyCode: 33, text: '' },
+            'PageDown': { code: 'PageDown', keyCode: 34, text: '' },
+        };
+
+        const mapped = keyMap[key] || { code: key, keyCode: 0, text: '' };
+
+        await sendCDPCommand(tabId, 'Input.dispatchKeyEvent', {
+            type: 'keyDown',
+            key: key,
+            code: mapped.code,
+            windowsVirtualKeyCode: mapped.keyCode,
+            nativeVirtualKeyCode: mapped.keyCode,
+            text: mapped.text,
+            modifiers
+        });
+        await sleep(humanDelay(30, 80));
+        await sendCDPCommand(tabId, 'Input.dispatchKeyEvent', {
+            type: 'keyUp',
+            key: key,
+            code: mapped.code,
+            windowsVirtualKeyCode: mapped.keyCode,
+            nativeVirtualKeyCode: mapped.keyCode,
+            modifiers
+        });
+    });
+}
+
+async function doScroll(tabId, x, y, deltaX, deltaY) {
+    return withCDP(tabId, async () => {
+        await sendCDPCommand(tabId, 'Input.dispatchMouseEvent', {
+            type: 'mouseWheel',
+            x,
+            y,
+            deltaX,
+            deltaY
+        });
+    });
+}
+
+async function doNavigate(tabId, url) {
+    return withCDP(tabId, async () => {
+        return await sendCDPCommand(tabId, 'Page.navigate', { url });
+    });
+}
+
+/**
+ * Executa múltiplas ações em uma única sessão attach/detach (batch).
+ * Cada ação: { action: 'click'|'type'|'keypress'|'scroll'|'navigate', ...params }
+ */
+async function doBatch(tabId, actions) {
+    return withCDP(tabId, async () => {
+        const results = [];
+        for (const action of actions) {
+            let result;
+            switch (action.action) {
+                case 'click':
+                    result = await doClickInner(tabId, action.x, action.y);
+                    break;
+                case 'type':
+                    result = await doTypeInner(tabId, action.text);
+                    break;
+                case 'keypress':
+                    result = await doKeyPressInner(tabId, action.key, action.modifiers || 0);
+                    break;
+                case 'scroll':
+                    result = await sendCDPCommand(tabId, 'Input.dispatchMouseEvent', {
+                        type: 'mouseWheel',
+                        x: action.x, y: action.y,
+                        deltaX: action.deltaX, deltaY: action.deltaY
+                    });
+                    break;
+                case 'navigate':
+                    result = await sendCDPCommand(tabId, 'Page.navigate', { url: action.url });
+                    break;
+                default:
+                    result = { error: `Unknown action: ${action.action}` };
+            }
+            results.push(result);
+            if (action.delay) await sleep(action.delay);
+        }
+        return results;
+    });
+}
+
+// Versões internas (sem withCDP) para uso dentro de batch
+async function doClickInner(tabId, x, y) {
+    const startX = Math.random() * 200;
+    const startY = Math.random() * 200;
+    const offsetX = (Math.random() - 0.5) * 4;
+    const offsetY = (Math.random() - 0.5) * 4;
+    const targetX = x + offsetX;
+    const targetY = y + offsetY;
+
+    const points = bezierPoints(startX, startY, targetX, targetY, 8);
+    for (const pt of points) {
+        await sendCDPCommand(tabId, 'Input.dispatchMouseEvent', {
+            type: 'mouseMoved', x: pt.x, y: pt.y
+        });
+        await sleep(humanDelay(5, 20));
+    }
+
+    await sendCDPCommand(tabId, 'Input.dispatchMouseEvent', {
+        type: 'mousePressed', x: targetX, y: targetY, button: 'left', clickCount: 1
+    });
+    await sleep(humanDelay(30, 80));
+    await sendCDPCommand(tabId, 'Input.dispatchMouseEvent', {
+        type: 'mouseReleased', x: targetX, y: targetY, button: 'left', clickCount: 1
+    });
+}
+
+async function doTypeInner(tabId, text) {
+    for (const char of text) {
+        await sendCDPCommand(tabId, 'Input.dispatchKeyEvent', {
+            type: 'keyDown', text: char, key: char,
+            code: `Key${char.toUpperCase()}`, unmodifiedText: char
+        });
+        await sleep(humanDelay(20, 50));
+        await sendCDPCommand(tabId, 'Input.dispatchKeyEvent', {
+            type: 'keyUp', key: char, code: `Key${char.toUpperCase()}`
+        });
+        await sleep(humanDelay(40, 150));
+    }
+}
+
+async function doKeyPressInner(tabId, key, modifiers = 0) {
+    const keyMap = {
+        'Enter': { code: 'Enter', keyCode: 13, text: '\r' },
+        'Tab': { code: 'Tab', keyCode: 9, text: '' },
+        'Escape': { code: 'Escape', keyCode: 27, text: '' },
+        'Backspace': { code: 'Backspace', keyCode: 8, text: '' },
+        'ArrowUp': { code: 'ArrowUp', keyCode: 38, text: '' },
+        'ArrowDown': { code: 'ArrowDown', keyCode: 40, text: '' },
+        'ArrowLeft': { code: 'ArrowLeft', keyCode: 37, text: '' },
+        'ArrowRight': { code: 'ArrowRight', keyCode: 39, text: '' },
+    };
+    const mapped = keyMap[key] || { code: key, keyCode: 0, text: '' };
+
+    await sendCDPCommand(tabId, 'Input.dispatchKeyEvent', {
+        type: 'keyDown', key, code: mapped.code,
+        windowsVirtualKeyCode: mapped.keyCode, nativeVirtualKeyCode: mapped.keyCode,
+        text: mapped.text, modifiers
+    });
+    await sleep(humanDelay(30, 80));
+    await sendCDPCommand(tabId, 'Input.dispatchKeyEvent', {
+        type: 'keyUp', key, code: mapped.code,
+        windowsVirtualKeyCode: mapped.keyCode, nativeVirtualKeyCode: mapped.keyCode, modifiers
+    });
 }
 
 // Listener para comandos do debugger
@@ -69,37 +371,78 @@ chrome.webNavigation.onCommitted.addListener((details) => {
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     // Tratamento específico para comandos do debugger
     if (request.type === 'debugger_command') {
-        const tabId = sender.tab.id;
-        
+        const tabId = sender.tab ? sender.tab.id : request.tabId;
+
         if (request.action === 'attach') {
             attachDebugger(tabId)
                 .then(() => sendResponse({ success: true }))
                 .catch(error => sendResponse({ success: false, error: error.message }));
             return true;
         }
-        
+
         if (request.action === 'detach') {
             detachDebugger(tabId)
                 .then(() => sendResponse({ success: true }))
                 .catch(error => sendResponse({ success: false, error: error.message }));
             return true;
         }
-        
+
         if (request.action === 'sendCommand') {
-            chrome.debugger.sendCommand(
-                { tabId },
-                request.command,
-                request.params || {},
-                (result) => {
-                    if (chrome.runtime.lastError) {
-                        sendResponse({ success: false, error: chrome.runtime.lastError.message });
-                    } else {
-                        sendResponse({ success: true, result });
-                    }
-                }
-            );
+            sendCDPCommand(tabId, request.command, request.params || {})
+                .then(result => sendResponse({ success: true, result }))
+                .catch(error => sendResponse({ success: false, error: error.message }));
             return true;
         }
+
+        if (request.action === 'setMode') {
+            cdpMode = request.mode === 'persistent' ? 'persistent' : 'transient';
+            sendResponse({ success: true, mode: cdpMode });
+            return true;
+        }
+
+        if (request.action === 'getMode') {
+            sendResponse({ success: true, mode: cdpMode });
+            return true;
+        }
+    }
+
+    // Tratamento para ações CDP humanizadas
+    if (request.type === 'cdp_action') {
+        const tabId = sender.tab ? sender.tab.id : request.tabId;
+
+        const handleAction = async () => {
+            try {
+                let result;
+                switch (request.action) {
+                    case 'click':
+                        result = await doClick(tabId, request.x, request.y);
+                        break;
+                    case 'type':
+                        result = await doType(tabId, request.text);
+                        break;
+                    case 'keypress':
+                        result = await doKeyPress(tabId, request.key, request.modifiers || 0);
+                        break;
+                    case 'scroll':
+                        result = await doScroll(tabId, request.x, request.y, request.deltaX, request.deltaY);
+                        break;
+                    case 'navigate':
+                        result = await doNavigate(tabId, request.url);
+                        break;
+                    case 'batch':
+                        result = await doBatch(tabId, request.actions);
+                        break;
+                    default:
+                        return { success: false, error: `Unknown CDP action: ${request.action}` };
+                }
+                return { success: true, result };
+            } catch (error) {
+                return { success: false, error: error.message };
+            }
+        };
+
+        handleAction().then(sendResponse);
+        return true;
     }
 
     handleMessage(request, sendResponse);

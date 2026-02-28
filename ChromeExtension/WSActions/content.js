@@ -138,6 +138,155 @@ function sendDebuggerCommand(action, params = {}) {
     });
 }
 
+/**
+ * Envia ação CDP humanizada para o background script
+ * @param {string} action - Ação CDP (click, type, keypress, scroll, navigate, batch)
+ * @param {Object} params - Parâmetros da ação
+ * @returns {Promise} Promessa que resolve com a resposta
+ */
+function sendCDPAction(action, params = {}) {
+    return new Promise((resolve, reject) => {
+        chrome.runtime.sendMessage({
+            type: 'cdp_action',
+            action,
+            ...params
+        }, (response) => {
+            if (chrome.runtime.lastError) {
+                reject(chrome.runtime.lastError);
+            } else {
+                resolve(response);
+            }
+        });
+    });
+}
+
+// =======================
+// CDP Bridge para Page Context
+// =======================
+
+/**
+ * Injeta o bridge CDP no contexto da página (window.__wsactions_cdp)
+ */
+function injectCDPBridge() {
+    const script = document.createElement('script');
+    script.textContent = `
+    (function() {
+        if (window.__wsactions_cdp) return;
+
+        let requestId = 0;
+        const pendingRequests = new Map();
+
+        function cdpRequest(data) {
+            return new Promise((resolve, reject) => {
+                const id = '__wsactions_cdp_' + (++requestId) + '_' + Date.now();
+                const timeout = setTimeout(() => {
+                    pendingRequests.delete(id);
+                    reject(new Error('CDP request timeout'));
+                }, 30000);
+
+                pendingRequests.set(id, { resolve, reject, timeout });
+
+                window.postMessage({
+                    type: 'wsactions-cdp-request',
+                    id: id,
+                    data: data
+                }, '*');
+            });
+        }
+
+        // Listener para respostas do content script
+        window.addEventListener('message', function(event) {
+            if (event.source !== window) return;
+            if (!event.data || event.data.type !== 'wsactions-cdp-response') return;
+
+            const pending = pendingRequests.get(event.data.id);
+            if (pending) {
+                clearTimeout(pending.timeout);
+                pendingRequests.delete(event.data.id);
+                if (event.data.error) {
+                    pending.reject(new Error(event.data.error));
+                } else {
+                    pending.resolve(event.data.result);
+                }
+            }
+        });
+
+        window.__wsactions_cdp = {
+            click: function(x, y) {
+                return cdpRequest({ action: 'click', x: x, y: y });
+            },
+            type: function(text) {
+                return cdpRequest({ action: 'type', text: text });
+            },
+            keypress: function(key, modifiers) {
+                return cdpRequest({ action: 'keypress', key: key, modifiers: modifiers || 0 });
+            },
+            scroll: function(x, y, deltaX, deltaY) {
+                return cdpRequest({ action: 'scroll', x: x, y: y, deltaX: deltaX, deltaY: deltaY });
+            },
+            navigate: function(url) {
+                return cdpRequest({ action: 'navigate', url: url });
+            },
+            attach: function() {
+                return cdpRequest({ action: 'attach' });
+            },
+            detach: function() {
+                return cdpRequest({ action: 'detach' });
+            },
+            setMode: function(mode) {
+                return cdpRequest({ action: 'setMode', mode: mode });
+            },
+            batch: function(actions) {
+                return cdpRequest({ action: 'batch', actions: actions });
+            }
+        };
+
+        console.log('WSActions CDP Bridge initialized');
+    })();
+    `;
+    (document.head || document.documentElement).appendChild(script);
+    script.remove();
+}
+
+/**
+ * Relay: escuta mensagens wsactions-cdp-request do page context
+ * e encaminha para o background via chrome.runtime.sendMessage
+ */
+function setupCDPRelay() {
+    window.addEventListener('message', async function(event) {
+        if (event.source !== window) return;
+        if (!event.data || event.data.type !== 'wsactions-cdp-request') return;
+
+        const { id, data } = event.data;
+
+        try {
+            let response;
+
+            // Comandos de controle do debugger
+            if (data.action === 'attach' || data.action === 'detach') {
+                response = await sendDebuggerCommand(data.action);
+            } else if (data.action === 'setMode') {
+                response = await sendDebuggerCommand('setMode', { mode: data.mode });
+            } else {
+                // Ações CDP humanizadas
+                response = await sendCDPAction(data.action, data);
+            }
+
+            window.postMessage({
+                type: 'wsactions-cdp-response',
+                id: id,
+                result: response
+            }, '*');
+        } catch (error) {
+            window.postMessage({
+                type: 'wsactions-cdp-response',
+                id: id,
+                error: error.message || 'CDP relay error'
+            }, '*');
+        }
+    });
+}
+
 // =======================
 // Sistema de Permissões
 // =======================
@@ -387,6 +536,10 @@ async function initialize() {
 
         // Adiciona o listener para mensagens
         window.addEventListener("message", messageListener, false);
+
+        // Injeta CDP bridge e configura relay
+        injectCDPBridge();
+        setupCDPRelay();
 
         console.log('WSActions Bridge initialized');
     } catch (error) {

@@ -1,0 +1,8 @@
+{
+    "id": "tools",
+    "name": "TOOLS",
+    "version": "1.0.0",
+    "description": "Chrome profile management, launcher generation and stealth tools",
+    "WEB_SCRIPTS": [],
+    "GLOBAL_SCRIPTS": []
+}
